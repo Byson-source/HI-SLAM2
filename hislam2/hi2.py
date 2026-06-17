@@ -156,7 +156,7 @@ class Hi2:
 
         # final refinement
         self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
-        updated_poses = self.gs.finalize()
+        updated_poses = self.gs.finalize(refine=not getattr(self.args, 'no_gs_refine', False))
         self.video.poses[:self.video.counter.value] = torch.tensor(updated_poses[:,1:])
 
         traj_full = self.traj_filler(self.images)

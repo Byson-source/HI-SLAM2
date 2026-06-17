@@ -78,6 +78,221 @@ def save_trajectory(hi2, traj_full, imagedir, output, start=0):
         np.savetxt(f"{output}/traj_full.txt", ttraj_full)
 
 
+# okvis_pose_graph_msgs/PoseGraph definition (vendored so the bag is self-contained).
+POSE_GRAPH_MSGDEF = """\
+std_msgs/Header        header
+uint64[]               vertex_id
+int64[]                vertex_stamp_ns
+geometry_msgs/Pose[]   vertex_pose
+uint64[]               edge_i
+uint64[]               edge_j
+geometry_msgs/Pose[]   edge_rel
+float64[]              edge_info_trans
+float64[]              edge_info_rot
+uint8[]                edge_type
+"""
+
+POSE_GRAPH_CONVENTION = (
+    "vertex_pose/edge_rel = [tx,ty,tz,qx,qy,qz,qw]; "
+    "vertex_pose = T_WS (world<-sensor); edge_rel = T_AB = T_WA^-1*T_WB (A<-B); "
+    "info = 1/sigma^2 diagonal")
+
+
+def build_pose_graph(hi2, imagedir, start=0, covis_thresh=None,
+                     vo_info=(500.0, 1000.0), loop_info=(800.0, 1600.0)):
+    """ build the keyframe pose graph following the ``okvis_pose_graph_msgs/PoseGraph``
+    schema (see zfloc_pgo_handoff.md §2). The returned dict is consumed both by
+    save_pose_graph (npz) and save_rosbag (ROS2 bag). Aligned arrays, vertices
+    indexed 0..N-1:
+
+      vertex_id        int64   [N]    keyframe id (= keyframe index)
+      vertex_stamp_ns  int64   [N]    timestamp parsed from the image filename
+      vertex_pose      float64 [N,7]  T_WS world<-sensor as [tx,ty,tz, qx,qy,qz,qw]
+      edge_i, edge_j   int64   [E]    vertex ids of the two edge ends (A, B)
+      edge_rel         float64 [E,7]  T_AB = T_WA^-1 * T_WB  (A<-B)
+      edge_info_trans  float64 [E]    translational diagonal information (1/sigma^2)
+      edge_info_rot    float64 [E]    rotational diagonal information
+      edge_type        uint8   [E]    0 = sequential VO, 1 = covisibility/loop
+    """
+    t = hi2.video.counter.value
+
+    # world<-sensor poses: video.poses are T_cw, so invert to get T_wc (= T_WS)
+    vertex_pose = lietorch.SE3(hi2.video.poses[:t].clone()).inv().data.detach().cpu().double().numpy()
+    vertex_id = np.arange(t, dtype=np.int64)
+
+    # per-keyframe timestamp parsed from the image filename (same as save_trajectory)
+    tstamps_full = np.array([float(re.findall(r"[+]?(?:\d*\.\d+|\d+)", x)[-1])
+                             for x in sorted(os.listdir(imagedir))[start:]])
+    kf_frame_idx = hi2.video.tstamp[:t].cpu().numpy().astype(int)
+    vertex_stamp_ns = tstamps_full[kf_frame_idx].astype(np.int64)
+
+    # covisibility flow-distance matrix between keyframes (lower = more covisible)
+    D = hi2.video.distance().detach().cpu().numpy()
+    if covis_thresh is None:
+        covis_thresh = float(hi2.config['Tracking']['backend']['backend_thresh'])
+
+    edge_i, edge_j, edge_type = [], [], []
+    for i in range(t - 1):                       # sequential VO edges
+        edge_i.append(i); edge_j.append(i + 1); edge_type.append(0)
+    for i in range(t):                           # non-adjacent covisibility / loop edges
+        for j in range(i + 2, t):
+            if D[i, j] < covis_thresh:
+                edge_i.append(i); edge_j.append(j); edge_type.append(1)
+    edge_i = np.asarray(edge_i, dtype=np.int64)
+    edge_j = np.asarray(edge_j, dtype=np.int64)
+    edge_type = np.asarray(edge_type, dtype=np.uint8)
+
+    # relative measurement T_AB = T_WA^-1 * T_WB computed from the world poses
+    Ti = lietorch.SE3(torch.as_tensor(vertex_pose[edge_i], device='cuda', dtype=torch.float))
+    Tj = lietorch.SE3(torch.as_tensor(vertex_pose[edge_j], device='cuda', dtype=torch.float))
+    edge_rel = (Ti.inv() * Tj).data.detach().cpu().double().numpy()
+
+    # constant diagonal information; loop edges weighted >= VO (handoff §4)
+    edge_info_trans = np.where(edge_type == 0, vo_info[0], loop_info[0]).astype(np.float64)
+    edge_info_rot = np.where(edge_type == 0, vo_info[1], loop_info[1]).astype(np.float64)
+
+    return dict(vertex_id=vertex_id, vertex_stamp_ns=vertex_stamp_ns, vertex_pose=vertex_pose,
+                edge_i=edge_i, edge_j=edge_j, edge_rel=edge_rel,
+                edge_info_trans=edge_info_trans, edge_info_rot=edge_info_rot, edge_type=edge_type)
+
+
+def save_pose_graph(pg, output):
+    """ save the pose graph dict (build_pose_graph) as ``{output}/pose_graph.npz``. """
+    np.savez(f"{output}/pose_graph.npz",
+             convention=np.array(POSE_GRAPH_CONVENTION, dtype=object), **pg)
+    et = pg['edge_type']
+    print(f"Saved pose graph: {len(pg['vertex_id'])} vertices, {len(pg['edge_i'])} edges "
+          f"({int((et == 0).sum())} VO / {int((et == 1).sum())} loop) -> {output}/pose_graph.npz")
+
+
+def save_rosbag(hi2, imagedir, output, pg, start=0, rate_hz=10.0, jpeg_quality=92,
+                image_topic='/okvis/okvis_cam0/image/compressed',
+                odometry_topic='/okvis/okvis_odometry',
+                trajectory_topic='/okvis/okvis_trajectory',
+                final_trajectory_topic='/okvis/okvis_trajectory_final',
+                pose_graph_topic='/okvis/okvis_pose_graph',
+                world_frame='map', camera_frame='cam0'):
+    """ write a ROS2 bag that is a drop-in replacement for the OKVIS bag the
+    ScaRF-SLAM mapping node consumes, using the pure-python ``rosbags`` library
+    (no ROS install needed). Topic names/types match ScaRF-SLAM's
+    okvis_slam_hilti.yaml so HI-SLAM2 can stand in for OKVIS:
+
+      {image_topic}             sensor_msgs/CompressedImage   keyframe rgb (jpeg)
+      {odometry_topic}          nav_msgs/Odometry             T_wc per keyframe (KF selection)
+      {trajectory_topic}        nav_msgs/Path                 camera-to-world snapshot (incremental)
+      {final_trajectory_topic}  nav_msgs/Path                 final loop-closed trajectory
+      {pose_graph_topic}        okvis_pose_graph_msgs/PoseGraph  for z-floc PGO (one msg at end)
+
+    ScaRF-SLAM admits a frame once it has a compressed image, an odometry pose,
+    and is covered by a trajectory snapshot (slam_topic_source.py). Poses are
+    T_wc (camera-to-world). Header stamps carry each keyframe's timestamp (parsed
+    from the image filename) so they match pose_graph vertex_stamp_ns / priors;
+    the bag record clock is a synthetic {rate_hz} Hz so the bag stays replayable
+    even when filenames are plain frame indices (e.g. Gibson).
+    """
+    import shutil
+    import cv2
+    from rosbags.rosbag2 import Writer
+    from rosbags.typesys import Stores, get_typestore, get_types_from_msg
+
+    ts = get_typestore(Stores.LATEST)
+    ts.register(get_types_from_msg(POSE_GRAPH_MSGDEF, 'okvis_pose_graph_msgs/msg/PoseGraph'))
+    Time = ts.types['builtin_interfaces/msg/Time']
+    Header = ts.types['std_msgs/msg/Header']
+    CompressedImage = ts.types['sensor_msgs/msg/CompressedImage']
+    Odometry = ts.types['nav_msgs/msg/Odometry']
+    Path = ts.types['nav_msgs/msg/Path']
+    PoseStamped = ts.types['geometry_msgs/msg/PoseStamped']
+    PoseWithCovariance = ts.types['geometry_msgs/msg/PoseWithCovariance']
+    TwistWithCovariance = ts.types['geometry_msgs/msg/TwistWithCovariance']
+    Twist = ts.types['geometry_msgs/msg/Twist']
+    Vector3 = ts.types['geometry_msgs/msg/Vector3']
+    Pose = ts.types['geometry_msgs/msg/Pose']
+    Point = ts.types['geometry_msgs/msg/Point']
+    Quaternion = ts.types['geometry_msgs/msg/Quaternion']
+    PoseGraph = ts.types['okvis_pose_graph_msgs/msg/PoseGraph']
+
+    def mk_time(ns):
+        ns = int(ns)
+        return Time(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000)
+
+    def mk_pose(p):
+        return Pose(position=Point(x=float(p[0]), y=float(p[1]), z=float(p[2])),
+                    orientation=Quaternion(x=float(p[3]), y=float(p[4]), z=float(p[5]), w=float(p[6])))
+
+    def mk_posestamped(p, stamp, frame):
+        return PoseStamped(header=Header(stamp=mk_time(stamp), frame_id=frame), pose=mk_pose(p))
+
+    zero36 = np.zeros(36, dtype=np.float64)
+    zero_twist = Twist(linear=Vector3(x=0.0, y=0.0, z=0.0), angular=Vector3(x=0.0, y=0.0, z=0.0))
+
+    bagpath = os.path.join(output, 'rosbag')
+    if os.path.exists(bagpath):
+        shutil.rmtree(bagpath)
+
+    t = len(pg['vertex_id'])
+    period = int(1e9 / rate_hz)
+    base = int(1e9)
+    stamps = pg['vertex_stamp_ns'].astype(np.int64)
+    poses = pg['vertex_pose']
+    kf_frame_idx = hi2.video.tstamp[:t].cpu().numpy().astype(int)
+
+    with Writer(bagpath, version=Writer.VERSION_LATEST) as writer:
+        c_img = writer.add_connection(image_topic, CompressedImage.__msgtype__, typestore=ts)
+        c_odom = writer.add_connection(odometry_topic, Odometry.__msgtype__, typestore=ts)
+        c_traj = writer.add_connection(trajectory_topic, Path.__msgtype__, typestore=ts)
+        c_final = writer.add_connection(final_trajectory_topic, Path.__msgtype__, typestore=ts)
+        c_pg = writer.add_connection(pose_graph_topic, PoseGraph.__msgtype__, typestore=ts)
+
+        traj_poses = []   # grows so /okvis/okvis_trajectory is an incremental snapshot
+        for i in range(t):
+            stamp = int(stamps[i])
+            bag_t = base + i * period
+
+            # compressed (jpeg) keyframe image; ScaRF decodes the bytes to rgb
+            rgb = hi2.images[int(kf_frame_idx[i])][0].permute(1, 2, 0).contiguous().cpu().numpy().astype(np.uint8)
+            ok, buf = cv2.imencode('.jpg', rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+            img = CompressedImage(header=Header(stamp=mk_time(stamp), frame_id=camera_frame),
+                                  format='bgr8; jpeg compressed bgr8',
+                                  data=np.asarray(buf, dtype=np.uint8).reshape(-1))
+            writer.write(c_img, bag_t, ts.serialize_cdr(img, CompressedImage.__msgtype__))
+
+            # odometry: camera-to-world pose, used for keyframe selection
+            odom = Odometry(header=Header(stamp=mk_time(stamp), frame_id=world_frame),
+                            child_frame_id=camera_frame,
+                            pose=PoseWithCovariance(pose=mk_pose(poses[i]), covariance=zero36.copy()),
+                            twist=TwistWithCovariance(twist=zero_twist, covariance=zero36.copy()))
+            writer.write(c_odom, bag_t, ts.serialize_cdr(odom, Odometry.__msgtype__))
+
+            # incremental camera-to-world trajectory snapshot
+            traj_poses.append(mk_posestamped(poses[i], stamp, world_frame))
+            traj = Path(header=Header(stamp=mk_time(stamp), frame_id=world_frame), poses=list(traj_poses))
+            writer.write(c_traj, bag_t, ts.serialize_cdr(traj, Path.__msgtype__))
+
+        # final loop-closed trajectory (full) + pose graph, after the last keyframe
+        last_stamp = int(stamps[-1])
+        final = Path(header=Header(stamp=mk_time(last_stamp), frame_id=world_frame),
+                     poses=[mk_posestamped(poses[i], int(stamps[i]), world_frame) for i in range(t)])
+        writer.write(c_final, base + t * period, ts.serialize_cdr(final, Path.__msgtype__))
+
+        pg_msg = PoseGraph(
+            header=Header(stamp=mk_time(last_stamp), frame_id=world_frame),
+            vertex_id=pg['vertex_id'].astype(np.uint64),
+            vertex_stamp_ns=stamps,
+            vertex_pose=[mk_pose(p) for p in poses],
+            edge_i=pg['edge_i'].astype(np.uint64),
+            edge_j=pg['edge_j'].astype(np.uint64),
+            edge_rel=[mk_pose(p) for p in pg['edge_rel']],
+            edge_info_trans=pg['edge_info_trans'].astype(np.float64),
+            edge_info_rot=pg['edge_info_rot'].astype(np.float64),
+            edge_type=pg['edge_type'].astype(np.uint8))
+        writer.write(c_pg, base + (t + 1) * period, ts.serialize_cdr(pg_msg, PoseGraph.__msgtype__))
+
+    print(f"Saved rosbag (OKVIS-compatible): {t} keyframes -> {bagpath}\n"
+          f"  {image_topic} (CompressedImage), {odometry_topic} (Odometry),\n"
+          f"  {trajectory_topic}/_final (Path), {pose_graph_topic} (PoseGraph)")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--imagedir", type=str, help="path to image directory")
@@ -96,6 +311,17 @@ if __name__ == '__main__':
 
     parser.add_argument("--start", type=int, default=0, help="start frame")
     parser.add_argument("--length", type=int, default=100000, help="number of frames to process")
+
+    parser.add_argument("--no_gs_refine", action="store_true",
+                        help="skip the final Global GS color refinement (much faster; lower-quality final map/renderings, "
+                             "poses come straight from the global BA)")
+    parser.add_argument("--pose_graph", action="store_true",
+                        help="export the keyframe pose graph (pose_graph.npz) for the z-floc PGO bridge")
+    parser.add_argument("--rosbag", action="store_true",
+                        help="save a ROS2 bag (keyframe image + pose + pose graph) for the z-floc / scarf pipeline")
+    parser.add_argument("--pg_covis_thresh", type=float, default=None,
+                        help="flow-distance threshold for covisibility/loop edges in the pose graph export "
+                             "(default: Tracking.backend.backend_thresh from the config)")
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -134,5 +360,11 @@ if __name__ == '__main__':
 
     traj = hi2.terminate()
     save_trajectory(hi2, traj, args.imagedir, args.output, start=args.start)
+    if args.pose_graph or args.rosbag:
+        pg = build_pose_graph(hi2, args.imagedir, start=args.start, covis_thresh=args.pg_covis_thresh)
+        if args.pose_graph:
+            save_pose_graph(pg, args.output)
+        if args.rosbag:
+            save_rosbag(hi2, args.imagedir, args.output, pg, start=args.start)
 
     print("Done")
