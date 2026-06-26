@@ -99,7 +99,7 @@ POSE_GRAPH_CONVENTION = (
 
 
 def build_pose_graph(hi2, imagedir, start=0, covis_thresh=None,
-                     vo_info=(500.0, 1000.0), loop_info=(800.0, 1600.0)):
+                     info_scale=500.0, covis_max=50.0, n=None):
     """ build the keyframe pose graph following the ``okvis_pose_graph_msgs/PoseGraph``
     schema (see zfloc_pgo_handoff.md §2). The returned dict is consumed both by
     save_pose_graph (npz) and save_rosbag (ROS2 bag). Aligned arrays, vertices
@@ -113,8 +113,19 @@ def build_pose_graph(hi2, imagedir, start=0, covis_thresh=None,
       edge_info_trans  float64 [E]    translational diagonal information (1/sigma^2)
       edge_info_rot    float64 [E]    rotational diagonal information
       edge_type        uint8   [E]    0 = sequential VO, 1 = covisibility/loop
+
+    Covisibility weighting (mirrors the OKVIS2-X design ``info = K*max(1,covis)``):
+    DROID/HI-SLAM2 has no integer landmark count, so the per-edge covisibility
+    strength is derived from the dense flow-distance ``D`` between keyframes
+    (lower D => more co-visible). ``s = clamp((thresh-D)/thresh, 0, 1)`` is mapped
+    to a pseudo-count ``covis = 1 + s*(covis_max-1)`` and ``info = info_scale*covis``.
+    Strongly co-observed pairs therefore form stiff edges, so a downstream
+    localizer's absolute priors correct global drift without distorting local shape.
+
+    ``n`` selects an incremental prefix (vertices 0..n-1) for real-time growing
+    publication; ``None`` uses all current keyframes.
     """
-    t = hi2.video.counter.value
+    t = hi2.video.counter.value if n is None else int(n)
 
     # world<-sensor poses: video.poses are T_cw, so invert to get T_wc (= T_WS)
     vertex_pose = lietorch.SE3(hi2.video.poses[:t].clone()).inv().data.detach().cpu().double().numpy()
@@ -127,29 +138,40 @@ def build_pose_graph(hi2, imagedir, start=0, covis_thresh=None,
     vertex_stamp_ns = tstamps_full[kf_frame_idx].astype(np.int64)
 
     # covisibility flow-distance matrix between keyframes (lower = more covisible)
-    D = hi2.video.distance().detach().cpu().numpy()
+    D = hi2.video.distance().detach().cpu().numpy()[:t, :t]
     if covis_thresh is None:
         covis_thresh = float(hi2.config['Tracking']['backend']['backend_thresh'])
 
-    edge_i, edge_j, edge_type = [], [], []
+    def covis_info(i, j):
+        # flow-distance -> covisibility strength s in [0,1] -> pseudo landmark count
+        s = max(0.0, min(1.0, (covis_thresh - float(D[i, j])) / max(covis_thresh, 1e-6)))
+        covis = 1.0 + s * (covis_max - 1.0)
+        return info_scale * covis
+
+    edge_i, edge_j, edge_type, edge_info = [], [], [], []
     for i in range(t - 1):                       # sequential VO edges
         edge_i.append(i); edge_j.append(i + 1); edge_type.append(0)
+        edge_info.append(covis_info(i, i + 1))
     for i in range(t):                           # non-adjacent covisibility / loop edges
         for j in range(i + 2, t):
             if D[i, j] < covis_thresh:
                 edge_i.append(i); edge_j.append(j); edge_type.append(1)
+                edge_info.append(covis_info(i, j))
     edge_i = np.asarray(edge_i, dtype=np.int64)
     edge_j = np.asarray(edge_j, dtype=np.int64)
     edge_type = np.asarray(edge_type, dtype=np.uint8)
 
-    # relative measurement T_AB = T_WA^-1 * T_WB computed from the world poses
-    Ti = lietorch.SE3(torch.as_tensor(vertex_pose[edge_i], device='cuda', dtype=torch.float))
-    Tj = lietorch.SE3(torch.as_tensor(vertex_pose[edge_j], device='cuda', dtype=torch.float))
-    edge_rel = (Ti.inv() * Tj).data.detach().cpu().double().numpy()
+    if len(edge_i):
+        # relative measurement T_AB = T_WA^-1 * T_WB computed from the world poses
+        Ti = lietorch.SE3(torch.as_tensor(vertex_pose[edge_i], device='cuda', dtype=torch.float))
+        Tj = lietorch.SE3(torch.as_tensor(vertex_pose[edge_j], device='cuda', dtype=torch.float))
+        edge_rel = (Ti.inv() * Tj).data.detach().cpu().double().numpy()
+    else:
+        edge_rel = np.zeros((0, 7), dtype=np.float64)
 
-    # constant diagonal information; loop edges weighted >= VO (handoff §4)
-    edge_info_trans = np.where(edge_type == 0, vo_info[0], loop_info[0]).astype(np.float64)
-    edge_info_rot = np.where(edge_type == 0, vo_info[1], loop_info[1]).astype(np.float64)
+    # covisibility-weighted diagonal information (info = info_scale * max(1, covis))
+    edge_info_trans = np.asarray(edge_info, dtype=np.float64)
+    edge_info_rot = edge_info_trans.copy()
 
     return dict(vertex_id=vertex_id, vertex_stamp_ns=vertex_stamp_ns, vertex_pose=vertex_pose,
                 edge_i=edge_i, edge_j=edge_j, edge_rel=edge_rel,
@@ -181,7 +203,7 @@ def save_rosbag(hi2, imagedir, output, pg, start=0, rate_hz=10.0, jpeg_quality=9
       {odometry_topic}          nav_msgs/Odometry             T_wc per keyframe (KF selection)
       {trajectory_topic}        nav_msgs/Path                 camera-to-world snapshot (incremental)
       {final_trajectory_topic}  nav_msgs/Path                 final loop-closed trajectory
-      {pose_graph_topic}        okvis_pose_graph_msgs/PoseGraph  for z-floc PGO (one msg at end)
+      {pose_graph_topic}        okvis_pose_graph_msgs/PoseGraph  for z-floc PGO (growing snapshot per keyframe)
 
     ScaRF-SLAM admits a frame once it has a compressed image, an odometry pose,
     and is covered by a trajectory snapshot (slam_topic_source.py). Poses are
@@ -237,6 +259,28 @@ def save_rosbag(hi2, imagedir, output, pg, start=0, rate_hz=10.0, jpeg_quality=9
     poses = pg['vertex_pose']
     kf_frame_idx = hi2.video.tstamp[:t].cpu().numpy().astype(int)
 
+    # full pose-graph edge arrays (edges stored with edge_i < edge_j); the real-time
+    # growing snapshot at keyframe i = vertices 0..i + edges fully inside that prefix.
+    pg_ei = pg['edge_i'].astype(np.int64)
+    pg_ej = pg['edge_j'].astype(np.int64)
+
+    def mk_posegraph(stamp, k):
+        """ growing pose-graph snapshot containing keyframes 0..k-1 (current poses).
+        Mirrors the OKVIS2-X per-keyframe incremental publication so the downstream
+        z-floc PGO sees the graph grow over the bag timeline rather than one final dump. """
+        em = pg_ej < k                     # both ends inside prefix (edge_i < edge_j < k)
+        return PoseGraph(
+            header=Header(stamp=mk_time(stamp), frame_id=world_frame),
+            vertex_id=pg['vertex_id'][:k].astype(np.uint64),
+            vertex_stamp_ns=stamps[:k],
+            vertex_pose=[mk_pose(p) for p in poses[:k]],
+            edge_i=pg_ei[em].astype(np.uint64),
+            edge_j=pg_ej[em].astype(np.uint64),
+            edge_rel=[mk_pose(p) for p in pg['edge_rel'][em]],
+            edge_info_trans=pg['edge_info_trans'][em].astype(np.float64),
+            edge_info_rot=pg['edge_info_rot'][em].astype(np.float64),
+            edge_type=pg['edge_type'][em].astype(np.uint8))
+
     with Writer(bagpath, version=Writer.VERSION_LATEST) as writer:
         c_img = writer.add_connection(image_topic, CompressedImage.__msgtype__, typestore=ts)
         c_odom = writer.add_connection(odometry_topic, Odometry.__msgtype__, typestore=ts)
@@ -268,6 +312,10 @@ def save_rosbag(hi2, imagedir, output, pg, start=0, rate_hz=10.0, jpeg_quality=9
             traj_poses.append(mk_posestamped(poses[i], stamp, world_frame))
             traj = Path(header=Header(stamp=mk_time(stamp), frame_id=world_frame), poses=list(traj_poses))
             writer.write(c_traj, bag_t, ts.serialize_cdr(traj, Path.__msgtype__))
+
+            # growing pose graph (vertices 0..i + enclosed edges) -> real-time PGO
+            writer.write(c_pg, bag_t,
+                         ts.serialize_cdr(mk_posegraph(stamp, i + 1), PoseGraph.__msgtype__))
 
         # final loop-closed trajectory (full) + pose graph, after the last keyframe
         last_stamp = int(stamps[-1])
