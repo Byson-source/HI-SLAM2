@@ -24,6 +24,13 @@ class Hi2:
         self.config = config = load_config(args.config)
         self.args = args
         self.images = {}
+        # Skip the online Gaussian-Splatting map (HISLAM2_NO_GS=1): the recorded bag
+        # only needs the SLAM trajectory + pose graph + keyframe images, not the 3DGS
+        # map. The per-keyframe GS mapping grows unbounded and stalls long handheld
+        # captures (e.g. LaMAR) mid-session; skipping it keeps tracking / frontend &
+        # backend BA / PGBA loop closure fully intact, so poses & pose graph are
+        # unchanged while the stall source is removed.
+        self.no_gs = os.environ.get('HISLAM2_NO_GS', '0') == '1'
 
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(config, args.image_size, args.buffer)
@@ -96,10 +103,10 @@ class Hi2:
 
         if len(viz_idx) and self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
-            if dposes is not None:
+            if dposes is not None and not self.no_gs:
                 self.call_gs(torch.arange(0, self.video.counter.value-1, device='cuda'), dposes[:-1], dscale[:-1])
 
-        if len(viz_idx):
+        if len(viz_idx) and not self.no_gs:
             self.call_gs(viz_idx)
 
     def terminate(self):
@@ -107,7 +114,7 @@ class Hi2:
         self.video.ready.value = 1
         if self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
-            if dposes is not None:
+            if dposes is not None and not self.no_gs:
                 self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
             self.mp_backend.terminate()
         del self.frontend
@@ -153,6 +160,13 @@ class Hi2:
         dposes = SE3(poses_pos).inv() * SE3(poses_pre)
         dscale = torch.ones(self.video.counter.value, 1)
         torch.cuda.empty_cache()
+
+        # final refinement (3DGS) — skipped under HISLAM2_NO_GS. The recorded bag uses
+        # the SLAM poses directly (frontend/backend BA + PGBA loop closure already wrote
+        # them back to video.poses), so no Gaussian map / color refine / render eval is
+        # needed. This avoids the GS finalize over an empty viewpoint set when GS was off.
+        if self.no_gs:
+            return self.traj_filler(self.images).inv().data.cpu().numpy()
 
         # final refinement
         self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
