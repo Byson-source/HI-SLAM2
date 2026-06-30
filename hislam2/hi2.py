@@ -139,9 +139,11 @@ class Hi2:
                 print(f' - add new keyframe {ind1} and {ind2} for {self.video.tstamp[i].item()}')
         new_kfs = sorted(list(set(new_kfs)))
 
-        # fill in poses for new keyframes
-        for i in range(0, len(new_kfs), 10):
-            new_kf = new_kfs[i:i+10]
+        # fill in poses for new keyframes (small batches keep the traj_filler correlation
+        # pyramid bounded so the terminate densification fits in GPU memory on long,
+        # high-keyframe-count captures; output is identical, only the chunking changes)
+        for i in range(0, len(new_kfs), 4):
+            new_kf = new_kfs[i:i+4]
             images = [self.images[i] for i in new_kf]
             Gs, gmap = self.traj_filler.fill(new_kf, images, return_fmap=True)
             inputs = torch.stack(images).cuda() / 255.0
