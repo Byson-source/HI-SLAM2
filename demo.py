@@ -30,6 +30,13 @@ def show_image(image, depth_prior, depth, normal):
 def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start=0, length=100000):
     """ image generator """
     RES = 341 * 640
+    # Optional working-resolution downscale: HISLAM2_RES_DIV=k shrinks the processing
+    # resolution linearly by k (area / k^2). Fewer pixels -> fewer per-keyframe gaussians
+    # and less GPU memory, which avoids the mid-sequence stall on long handheld captures
+    # (e.g. LaMAR). Default 1.0 = unchanged. Intrinsics scale with the resize below.
+    res_div = float(os.environ.get('HISLAM2_RES_DIV', '1.0'))
+    if res_div > 1.0:
+        RES = RES / (res_div * res_div)
 
     calib = np.loadtxt(calib, delimiter=" ")
     K = np.array([[calib[0], 0, calib[2]],[0, calib[1], calib[3]],[0,0,1]])
