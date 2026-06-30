@@ -118,6 +118,9 @@ class Hi2:
                 self.call_gs(torch.arange(0, self.video.counter.value, device='cuda'), dposes, dscale)
             self.mp_backend.terminate()
         del self.frontend
+        torch.cuda.empty_cache()   # reclaim frontend factor-graph correlation before the
+                                   # keyframe densification below (avoids terminate OOM on
+                                   # long high-keyframe-count captures, e.g. LaMAR handheld)
 
         # check if new keyframes need to be added
         deltas = np.add.accumulate(self.filterx.deltas)
@@ -149,6 +152,7 @@ class Hi2:
                 self.video.shift(place)
                 depth, normal = self.filterx.prior_extractor(inputs[i])
                 self.video[place] = (ind, images[i], Gs.data[i], self.video.disps[place].mean(), depth.cpu(), normal.cpu(), None, gmap[i], net[i,0], inp[i,0])
+            torch.cuda.empty_cache()   # free per-batch traj_filler correlation pyramids
         del self.filterx
 
         # global bundle adjustment
