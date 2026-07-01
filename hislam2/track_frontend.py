@@ -1,22 +1,9 @@
-import os
 import torch
 import lietorch
 import numpy as np
 
 from lietorch import SE3
 from factor_graph import FactorGraph
-
-
-def _prior_scale(disps, disps_prior):
-    """ per-keyframe scale mapping the depth prior onto the working-scale disps:
-    median(disps) / median(disps_prior). The prior median is taken over VALID
-    (> 0) pixels only, so a sparse sensor prior (LiDAR: 0 where out of range / low
-    confidence) does not collapse the median to 0. Falls back to the disps median
-    (scale 1) when no prior pixel is valid. Identical to the dense case (all pixels
-    valid) for the Omnidata prior. """
-    valid = disps_prior > 0
-    pm = disps_prior[valid].median() if valid.any() else disps.median()
-    return disps.median() / pm
 
 
 class TrackFrontend:
@@ -40,12 +27,6 @@ class TrackFrontend:
         self.frontend_thresh = config["frontend_thresh"]
         self.frontend_radius = config["frontend_radius"]
         self.video.mono_depth_alpha = config["mono_depth_alpha"]
-        # allow raising the depth-prior weight at runtime; the config default (0.01) is
-        # tuned for the noisy Omnidata learned prior, whereas a trustworthy sensor
-        # (LiDAR) prior warrants a stronger pull. HISLAM2_MONO_ALPHA overrides it.
-        _alpha_env = os.environ.get("HISLAM2_MONO_ALPHA")
-        if _alpha_env is not None:
-            self.video.mono_depth_alpha = float(_alpha_env)
 
     def __update(self, is_last):
         """ add edges, perform update """
@@ -58,7 +39,7 @@ class TrackFrontend:
         self.graph.add_proximity_factors(self.t1-5, max(self.t1-self.frontend_window, 0), 
             rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, remove=True)
 
-        self.video.dscales[self.t1-1] = _prior_scale(self.video.disps[self.t1-1], self.video.disps_prior[self.t1-1])
+        self.video.dscales[self.t1-1] = self.video.disps[self.t1-1].median() / self.video.disps_prior[self.t1-1].median()
         for itr in range(self.iters1):
             self.graph.update(None, None, use_inactive=True, use_mono=itr>1)
 
@@ -104,7 +85,7 @@ class TrackFrontend:
         # refine optimization
         self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
         for i in range(self.t1):
-            self.video.dscales[i] = _prior_scale(self.video.disps[i], self.video.disps_prior[i])
+            self.video.dscales[i] = self.video.disps[i].median() / self.video.disps_prior[i].median()
         for itr in range(8):
             self.graph.update(1, use_inactive=True, use_mono=itr>2)
 

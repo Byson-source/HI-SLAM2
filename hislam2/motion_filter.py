@@ -72,25 +72,10 @@ class MotionFilter:
         normal = normal.float().squeeze()
         return depth, normal
 
-    @staticmethod
-    def _merge_depth_prior(depth_omni, depth_lidar):
-        """ replace the Omnidata (learned, relative) depth with the real sensor depth
-        where the sensor is valid. ``depth_lidar`` is metric [m] at the working
-        resolution with 0 marking invalid pixels (low ARKit confidence / out of LiDAR
-        range). Invalid pixels stay 0 so ``DepthVideo`` masks them out of the prior term
-        (``disps_prior = where(depth>0, 1/depth, 0)``), i.e. only sensor-observed pixels
-        constrain the BA. Normals still come from Omnidata (LiDAR carries none). """
-        dl = depth_lidar.to(depth_omni.device, torch.float)
-        return torch.where(dl > 0, dl, torch.zeros_like(depth_omni))
-
     @torch.cuda.amp.autocast(enabled=True)
     @torch.no_grad()
-    def track(self, tstamp, image, intrinsics=None, is_last=False, depth_prior=None):
-        """ main update operation - run on every frame in video.
-
-        ``depth_prior`` (optional) is the real sensor depth [m] at the working
-        resolution (0 = invalid); when given it replaces the Omnidata depth as the
-        keyframe depth prior (see _merge_depth_prior). """
+    def track(self, tstamp, image, intrinsics=None, is_last=False):
+        """ main update operation - run on every frame in video """
 
         Id = lietorch.SE3.Identity(1,).data.squeeze()
         ht = image.shape[-2] // 8
@@ -109,8 +94,6 @@ class MotionFilter:
         ### always add first frame to the depth video ###
         if self.video.counter.value == 0:
             depth, normal = self.prior_extractor(inputs[0])
-            if depth_prior is not None:
-                depth = self._merge_depth_prior(depth, depth_prior)
             net, inp = self.context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
             self.video.append(tstamp, image[0], None, 1.0, depth, normal, intrinsics, gmap, net[0], inp[0])
@@ -130,15 +113,11 @@ class MotionFilter:
             if delta.norm(dim=-1).mean().item() > thresh or is_last:
                 index_min = np.argmax(self.shapeness)
                 if self.skip_blur and self.shapeness[index_min] > s:
-                    # swap in the cached sharper frame together with its own sensor
-                    # depth so the depth prior stays aligned to the chosen keyframe
-                    tstamp, image, intrinsics, gmap, inputs, depth_prior = self.cache[index_min]
+                    tstamp, image, intrinsics, gmap, inputs = self.cache[index_min]
                 self.shapeness = [0]*5
                 self.cache = [None]*5
 
                 depth, normal = self.prior_extractor(inputs[0])
-                if depth_prior is not None:
-                    depth = self._merge_depth_prior(depth, depth_prior)
                 self.count = 0
                 net, inp = self.context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
@@ -146,5 +125,5 @@ class MotionFilter:
 
             else:
                 self.shapeness[tstamp%5] = s
-                self.cache[tstamp%5] = [tstamp, image, intrinsics, gmap, inputs, depth_prior]
+                self.cache[tstamp%5] = [tstamp, image, intrinsics, gmap, inputs]
                 self.count += 1
