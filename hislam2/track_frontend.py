@@ -19,6 +19,14 @@ def _prior_scale(disps, disps_prior):
     return disps.median() / pm
 
 
+# Metric-anchor mode: with a real (metric) sensor depth prior, fix the depth-prior
+# scale ``dscales`` to a single GLOBAL working->metric value and freeze it (here +
+# in geom/ba.py), instead of re-fitting it per keyframe. This lets the metric prior
+# pin absolute scale across all keyframes so it stops drifting. Off => original
+# per-frame free-scale behaviour (Omnidata shape prior).
+_METRIC_ANCHOR = os.environ.get('HISLAM2_DEPTH_METRIC', '0') == '1'
+
+
 class TrackFrontend:
     def __init__(self, net, video, config):
         self.video = video
@@ -58,7 +66,12 @@ class TrackFrontend:
         self.graph.add_proximity_factors(self.t1-5, max(self.t1-self.frontend_window, 0), 
             rad=self.frontend_radius, nms=self.frontend_nms, thresh=self.frontend_thresh, remove=True)
 
-        self.video.dscales[self.t1-1] = _prior_scale(self.video.disps[self.t1-1], self.video.disps_prior[self.t1-1])
+        if _METRIC_ANCHOR:
+            # keep the frozen global metric scale: inherit the previous keyframe's
+            # dscales (already tracks any global sim3 rescale from loop closure)
+            self.video.dscales[self.t1-1] = self.video.dscales[self.t1-2]
+        else:
+            self.video.dscales[self.t1-1] = _prior_scale(self.video.disps[self.t1-1], self.video.disps_prior[self.t1-1])
         for itr in range(self.iters1):
             self.graph.update(None, None, use_inactive=True, use_mono=itr>1)
 
@@ -105,6 +118,11 @@ class TrackFrontend:
         self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
         for i in range(self.t1):
             self.video.dscales[i] = _prior_scale(self.video.disps[i], self.video.disps_prior[i])
+        if _METRIC_ANCHOR:
+            # collapse the per-frame prior scales to one GLOBAL median working->metric
+            # scale (frozen thereafter) so the metric prior anchors absolute scale
+            g = self.video.dscales[:self.t1].median()
+            self.video.dscales[:self.t1] = g
         for itr in range(8):
             self.graph.update(1, use_inactive=True, use_mono=itr>2)
 

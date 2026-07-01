@@ -1,3 +1,4 @@
+import os
 import lietorch
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,13 @@ from .chol import block_solve, schur_solve, schur_solve_mono_prior
 import geom.projective_ops as pops
 
 from torch_scatter import scatter_sum
+
+# When a metric sensor depth prior anchors absolute scale (HISLAM2_DEPTH_METRIC=1),
+# freeze the per-keyframe depth-prior scale ``dscales`` in the joint depth/scale BA:
+# leaving it free lets each frame rescale the prior to match its (drifting) disps,
+# discarding the metric information. Frozen, the prior pulls disps onto the metric
+# depth at a single shared scale, so absolute scale stops drifting.
+_FREEZE_DSCALES = os.environ.get('HISLAM2_DEPTH_METRIC', '0') == '1'
 
 
 # utility functions for scattering ops
@@ -211,7 +219,8 @@ def JDSA(target, weight, eta, poses, disps, intrinsics, disps_prior, dscales, ii
 
     ### 4: apply retraction ###
     disps = disp_retr(disps, dz.view(B,-1,ht,wd), kx)
-    dscales[kx] += dso.view(-1, hs, ws)
+    if not _FREEZE_DSCALES:
+        dscales[kx] += dso.view(-1, hs, ws)
 
     disps = torch.where(disps > 10, torch.zeros_like(disps), disps)
     disps = disps.clamp(min=0.001)
