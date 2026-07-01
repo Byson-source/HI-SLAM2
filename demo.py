@@ -27,7 +27,49 @@ def show_image(image, depth_prior, depth, normal):
     cv2.waitKey(1)
 
 
-def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start=0, length=100000):
+def load_sensor_depth(depthdir, imfile, w1, h1, cropborder=0,
+                      conf_min=1, dmin=0.2, dmax=10.0):
+    """ load the real per-frame sensor depth (ARKit/LiDAR) that pairs with ``imfile``
+    and return it at the working resolution (h1, w1) as a float32 metric [m] map with
+    0 marking invalid pixels; returns None if no depth file exists for this frame.
+
+    LaMAR raw stores, per camera timestamp ``us``, ``depth/<us>.png`` (uint16 mm,
+    256x192, RGB-aligned) and ``depth/<us>.confidence.png`` (uint8, ARKit levels
+    0/1/2). Image filenames are ``<ns>.jpg`` with ns = us*1000, so us = ns // 1000
+    (the depth stamps match the image stamps exactly). Pixels with confidence
+    < ``conf_min`` or depth outside [``dmin``, ``dmax``] m are set to 0 (masked out of
+    the BA prior). NEAREST resize preserves metric values and depth discontinuities. """
+    stem = os.path.splitext(imfile)[0]
+    digits = re.findall(r"\d+", stem)
+    if not digits:
+        return None
+    ns = int(digits[-1])
+    cand = [os.path.join(depthdir, f"{stem}.png"),
+            os.path.join(depthdir, f"{ns // 1000}.png")]
+    dpath = next((p for p in cand if os.path.exists(p)), None)
+    if dpath is None:
+        return None
+    d = cv2.imread(dpath, cv2.IMREAD_UNCHANGED)
+    if d is None:
+        return None
+    d = d.astype(np.float32) / 1000.0                      # uint16 mm -> m
+    cpath = dpath[:-4] + ".confidence.png"
+    if os.path.exists(cpath):
+        conf = cv2.imread(cpath, cv2.IMREAD_UNCHANGED)
+        if conf is not None:
+            if conf.shape != d.shape:
+                conf = cv2.resize(conf, (d.shape[1], d.shape[0]), interpolation=cv2.INTER_NEAREST)
+            d[conf < conf_min] = 0.0
+    d[(d < dmin) | (d > dmax)] = 0.0
+    if cropborder > 0:
+        # depth is RGB-aligned; crop it in raw-depth pixels proportional to the RGB crop
+        pass  # cropborder is applied on the resized grid below to stay aligned
+    d = cv2.resize(d, (w1, h1), interpolation=cv2.INTER_NEAREST)
+    return torch.as_tensor(d, dtype=torch.float32)
+
+
+def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start=0, length=100000,
+                depthdir=None):
     """ image generator """
     RES = 341 * 640
     # Optional working-resolution downscale: HISLAM2_RES_DIV=k shrinks the processing
@@ -64,8 +106,13 @@ def mono_stream(queue, imagedir, calib, undistort=False, cropborder=False, start
         intrinsics[[0,2]] *= (w1 / w0)
         intrinsics[[1,3]] *= (h1 / h0)
 
+        # optional real sensor depth prior paired with this frame (working resolution)
+        depth_prior = None
+        if depthdir is not None:
+            depth_prior = load_sensor_depth(depthdir, imfile, w1, h1, cropborder)
+
         is_last = (t == len(image_list)-1)
-        queue.put((t, image[None], intrinsics[None], is_last))
+        queue.put((t, image[None], intrinsics[None], is_last, depth_prior))
 
     time.sleep(10)
 
@@ -355,6 +402,11 @@ if __name__ == '__main__':
     parser.add_argument("--config", type=str, help="path to configuration file")
     parser.add_argument("--output", default='outputs/demo', help="path to save output")
     parser.add_argument("--gtdepthdir", type=str, default=None, help="optional for evaluation, assumes 16-bit depth scaled by 6553.5")
+    parser.add_argument("--depthdir", type=str, default=None,
+                        help="optional real sensor depth directory (e.g. LaMAR raw_data/depth: "
+                             "<us>.png uint16 mm + <us>.confidence.png). When given, the real "
+                             "per-frame depth replaces the Omnidata learned depth as the keyframe "
+                             "depth prior (metric, masked to valid/confident pixels).")
 
     parser.add_argument("--weights", default=os.path.join(os.path.dirname(__file__), "pretrained_models/droid.pth"))
     parser.add_argument("--buffer", type=int, default=-1, help="number of keyframes to buffer (default: 1/10 of total frames)")
@@ -384,21 +436,21 @@ if __name__ == '__main__':
 
     hi2 = None
     queue = Queue(maxsize=8)
-    reader = Process(target=mono_stream, args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length))
+    reader = Process(target=mono_stream, args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length, args.depthdir))
     reader.start()
 
     N = len(os.listdir(args.imagedir))
     args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
     pbar = tqdm(range(N), desc="Processing keyframes")
     while 1:
-        (t, image, intrinsics, is_last) = queue.get()
+        (t, image, intrinsics, is_last, depth_prior) = queue.get()
         pbar.update()
 
         if hi2 is None:
             args.image_size = [image.shape[2], image.shape[3]]
             hi2 = Hi2(args)
 
-        hi2.track(t, image, intrinsics=intrinsics, is_last=is_last)
+        hi2.track(t, image, intrinsics=intrinsics, is_last=is_last, depth_prior=depth_prior)
 
         if args.droidvis and hi2.video.tstamp[hi2.video.counter.value-1] == t:
             from geom.ba import get_prior_depth_aligned

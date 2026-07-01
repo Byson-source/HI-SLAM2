@@ -89,14 +89,18 @@ class Hi2:
                 'scale_updates': dscale.to(device='cpu') if dscale is not None else None}
         self.gs.process_track_data(data)
 
-    def track(self, tstamp, image, intrinsics=None, is_last=False):
-        """ main thread - update map """
+    def track(self, tstamp, image, intrinsics=None, is_last=False, depth_prior=None):
+        """ main thread - update map.
+
+        ``depth_prior`` (optional) is the real sensor depth [m] at the working
+        resolution (0 = invalid) forwarded to the motion filter, where it replaces the
+        Omnidata learned depth as the keyframe depth prior. """
 
         with torch.no_grad():
             self.images[tstamp] = image
 
             # check there is enough motion
-            self.filterx.track(tstamp, image, intrinsics, is_last)
+            self.filterx.track(tstamp, image, intrinsics, is_last, depth_prior)
 
             # local bundle adjustment
             viz_idx = self.frontend(is_last=is_last)

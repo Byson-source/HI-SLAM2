@@ -68,7 +68,9 @@ class DepthVideo:
             self.disps[index] = item[3]
 
         if item[4] is not None:
-            self.disps_prior_up[index] = 1.0/item[4]
+            # guard the reciprocal against invalid (0) pixels of a sparse sensor prior
+            # (would otherwise be +inf); 0 disparity == "no prior", matching disps_prior
+            self.disps_prior_up[index] = torch.where(item[4]>0, 1.0/item[4], torch.zeros_like(item[4]))
             depth = item[4][3::8,3::8]
             self.disps_prior[index] = torch.where(depth>0, 1.0/depth, 0).cuda()
 
